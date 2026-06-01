@@ -424,6 +424,227 @@ def download_tiled_image(session, base, params, output_path, force_zoom, no_max_
     return str(out.resolve())
 
 
+# ── Format Matterport cubemap ────────────────────────────────────────────────
+# URL : https://cdn-N.matterport.com/models/[model]/assets/~/tiles/[sweep]/[size]_face[F]_[X]_[Y][suffix].jpg?t=...
+
+# Disposition en croix : (col, row) pour chaque face
+#        col0   col1   col2   col3
+# row0          face0
+# row1   face4  face1  face2  face3
+# row2          face5
+CUBEMAP_CROSS = {
+    0: (1, 0),  # top    (+Y)
+    1: (1, 1),  # front  (+Z)
+    2: (2, 1),  # right  (+X)
+    3: (3, 1),  # back   (-Z)
+    4: (0, 1),  # left   (-X)
+    5: (1, 2),  # bottom (-Y)
+}
+
+# Paramètres de projection pour chaque face (sc, tc, ma_sign, x_sign, y_sign, z_sign)
+# Convention OpenGL cubemap → direction (dx,dy,dz) vers UV sur la face
+_FACE_PROJ = {
+    # face_id: (lambda dx,dy,dz -> (sc, tc, ma))
+    0: lambda x, y, z: ( x,  z,  y),   # +Y top
+    5: lambda x, y, z: ( x, -z, -y),   # -Y bottom
+    1: lambda x, y, z: ( x, -y,  z),   # +Z front
+    3: lambda x, y, z: (-x, -y, -z),   # -Z back
+    2: lambda x, y, z: (-z, -y,  x),   # +X right
+    4: lambda x, y, z: ( z, -y, -x),   # -X left
+}
+
+
+def parse_matterport_url(url):
+    """
+    Retourne (cdn_base, quality, query) ou None.
+    cdn_base = .../tiles/[sweep_id]
+    quality  = '4k' | '2k' | '1k' | '512' | etc.
+    query    = '?t=...&k=...&imgopt=1'
+    """
+    m = re.match(
+        r'(https://cdn-\d\.matterport\.com/models/[a-f0-9]+/assets/[^/]+/tiles/[a-f0-9]+)'
+        r'/([A-Za-z0-9]+)_face\d+_\d+_\d+\.jpg(\?.*)?$',
+        url.strip()
+    )
+    if m:
+        return m.group(1), m.group(2), m.group(3) or ''
+    return None
+
+
+# Qualites dans l'ordre décroissant de résolution
+_MP_QUALITIES = ['8k', '4k', '2k', '1k', '512', '256']
+
+
+def build_mp_tile_url(cdn_base, quality, face, x, y, query):
+    return f"{cdn_base}/{quality}_face{face}_{x}_{y}.jpg{query}"
+
+
+def find_best_quality(session, cdn_base, query):
+    """Retourne la meilleure qualité disponible et la taille de la grille."""
+    for q in _MP_QUALITIES:
+        u = build_mp_tile_url(cdn_base, q, 0, 0, 0, query)
+        tile = fetch_tile(session, u)
+        if tile is None:
+            continue
+        tile_px = tile.width  # tuiles toujours carrees (512px)
+
+        cols = 0
+        for x in range(50):
+            if fetch_tile(session, build_mp_tile_url(cdn_base, q, 0, x, 0, query)) is None:
+                cols = x; break
+        else:
+            cols = 50
+
+        rows = 0
+        for y in range(50):
+            if fetch_tile(session, build_mp_tile_url(cdn_base, q, 0, 0, y, query)) is None:
+                rows = y; break
+        else:
+            rows = 50
+
+        cols = max(cols, 1)
+        rows = max(rows, 1)
+        print(f"  Qualite {q} : {cols} x {rows} tuiles = {cols*tile_px} x {rows*tile_px} px/face")
+        return q, cols, rows, tile_px
+
+    return None, 0, 0, 0
+
+
+def cubemap_to_equirectangular(face_images):
+    """
+    Convertit les 6 faces d'un cubemap Matterport en image équirectangulaire.
+    face_images : dict {face_id (0-5): PIL.Image}
+    Résolution de sortie : face_size*4 × face_size*2
+    """
+    import numpy as np
+
+    face_size = next(iter(face_images.values())).width
+    out_w = face_size * 4
+    out_h = face_size * 2
+
+    # Convertir chaque face en tableau numpy
+    faces = {
+        fid: np.array(img.convert('RGB').resize((face_size, face_size), Image.LANCZOS))
+        for fid, img in face_images.items()
+    }
+
+    # Angles sphériques pour chaque pixel de sortie
+    theta = np.linspace(0, 2 * np.pi, out_w, endpoint=False)   # longitude
+    phi   = np.linspace(np.pi / 2, -np.pi / 2, out_h)          # latitude
+
+    THETA, PHI = np.meshgrid(theta, phi)
+
+    # Vecteur direction 3D
+    dx = np.cos(PHI) * np.sin(THETA)
+    dy = np.sin(PHI)
+    dz = np.cos(PHI) * np.cos(THETA)
+
+    abs_x, abs_y, abs_z = np.abs(dx), np.abs(dy), np.abs(dz)
+
+    # Masque par face (face dominante)
+    face_masks = {
+        0: (abs_y >= abs_x) & (abs_y >= abs_z) & (dy >= 0),   # +Y top
+        5: (abs_y >= abs_x) & (abs_y >= abs_z) & (dy <  0),   # -Y bottom
+        1: (abs_z >= abs_x) & (abs_z >  abs_y) & (dz >= 0),   # +Z front
+        3: (abs_z >= abs_x) & (abs_z >  abs_y) & (dz <  0),   # -Z back
+        2: (abs_x >  abs_y) & (abs_x >  abs_z) & (dx >= 0),   # +X right
+        4: (abs_x >  abs_y) & (abs_x >  abs_z) & (dx <  0),   # -X left
+    }
+
+    output = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    fs1 = face_size - 1
+
+    for fid, mask in face_masks.items():
+        if fid not in faces:
+            continue
+        proj = _FACE_PROJ[fid]
+        sc, tc, ma = proj(dx[mask], dy[mask], dz[mask])
+
+        # UV dans [-1, 1] → pixels [0, face_size-1]
+        pu = np.clip(((sc / ma + 1) * 0.5 * fs1).astype(np.int32), 0, fs1)
+        pv = np.clip(((tc / ma + 1) * 0.5 * fs1).astype(np.int32), 0, fs1)
+
+        oy, ox = np.where(mask)
+        output[oy, ox] = faces[fid][pv, pu]
+
+    return Image.fromarray(output, 'RGB')
+
+
+def download_matterport_cubemap(session, cdn_base, quality_hint, query, output_path):
+    print(f"Mode MATTERPORT cubemap detecte")
+    print(f"  Base : ...{cdn_base[-50:]}")
+    print(f"Recherche de la meilleure qualite disponible...")
+
+    quality, cols, rows, tile_px = find_best_quality(session, cdn_base, query)
+    if not quality:
+        print("Aucune qualite disponible.")
+        return None
+
+    face_w = cols * tile_px
+    face_h = rows * tile_px
+    total  = 6 * cols * rows
+    n = 0
+
+    face_images = {}
+    print(f"\nTelechargement des {total} tuiles (6 faces x {cols}x{rows})...")
+
+    for face in range(6):
+        tiles = {}
+        for y in range(rows):
+            for x in range(cols):
+                u = build_mp_tile_url(cdn_base, quality, face, x, y, query)
+                tile = fetch_tile(session, u)
+                n += 1
+                if tile:
+                    tiles[(x, y)] = tile
+                    print(f"\r  {n}/{total}  face{face} ({x},{y}) OK   ", end='', flush=True)
+                else:
+                    print(f"\r  {n}/{total}  face{face} ({x},{y}) ECHEC", end='', flush=True)
+
+        if tiles:
+            face_img = stitch(tiles, cols, rows, tile_px, tile_px)
+            face_images[face] = face_img
+
+    print(f"\n  {len(face_images)}/6 faces telechargees")
+
+    if not face_images:
+        print("Aucune face telechargee.")
+        return None
+
+    # Assemblage en croix (4 x 3 faces)
+    print("\nAssemblage en croix...")
+    cross_w = face_w * 4
+    cross_h = face_h * 3
+    cross = Image.new('RGB', (cross_w, cross_h), (0, 0, 0))
+
+    for face, img in face_images.items():
+        col, row = CUBEMAP_CROSS[face]
+        cross.paste(img, (col * face_w, row * face_h))
+
+    # Conversion cubemap → équirectangulaire
+    print(f"Conversion equirectangulaire ({face_w*4} x {face_h*2} px)...")
+    full = cubemap_to_equirectangular(face_images)
+    print("  Conversion terminee.")
+
+    transparent = has_transparency(full)
+    ext = 'png' if transparent else 'jpg'
+    if output_path is None:
+        ts = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+        output_path = SCRIPT_DIR / f'{ts}_-_Image.{ext}'
+    out = Path(output_path)
+
+    if transparent:
+        full.save(out, 'PNG')
+    else:
+        full.save(out, 'JPEG', quality=95)
+
+    mb = out.stat().st_size / 1024 / 1024
+    print(f"\nSauvegarde : {out.resolve()}")
+    print(f"Dimensions : {full.width} x {full.height} px  ({face_w}x{face_h} par face)")
+    print(f"Taille     : {mb:.1f} Mo")
+    return str(out.resolve())
+
+
 # ── Scraper Google Arts & Culture ────────────────────────────────────────────
 
 def is_arts_culture_url(url):
@@ -527,6 +748,12 @@ def run(url, output_path=None, force_zoom=None, no_max_zoom=False):
         if url is None:
             return None
         print()
+
+    # Format Matterport cubemap : https://cdn-N.matterport.com/.../tiles/.../[q]_face[F]_[X]_[Y].jpg?t=...
+    mp = parse_matterport_url(url)
+    if mp:
+        cdn_base, quality, query = mp
+        return download_matterport_cubemap(session, cdn_base, quality, query, output_path)
 
     # Format ggpht (panoramas) : https://lh3.ggpht.com/.../xN-yN-zN/ID
     ggpht = parse_ggpht_url(url)
